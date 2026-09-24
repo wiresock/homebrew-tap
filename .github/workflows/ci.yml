@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Catch Homebrew style/audit drift and upstream source-archive changes.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_ANALYTICS: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+  # livecheck's github_latest strategy uses the GitHub API.
+  HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+  EXPECTED_VERSION: "0.7.0"
+  EXPECTED_URL: https://github.com/wiresock/alighieri/archive/refs/tags/v0.7.0.tar.gz
+  EXPECTED_SHA256: 0f1579a192ff506fe1cef2de7f2ab32348c896c01db11e080768b6358bb1f98b
+  EXPECTED_COMMIT: b52407cbcd490ba56c3543e278aaef20869114f9
+  EXPECTED_RUSTLS: "0.23.45"
+
+jobs:
+  alighieri:
+    name: alighieri (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both architectures validate the formula (it must not assume a
+        # prefix). Only Apple Silicon builds it: Homebrew treats Intel macOS
+        # as Tier 3 with no bottles, so an Intel install first compiles LLVM
+        # and Rust from source, which does not fit a hosted-runner job.
+        include:
+          - os: macos-latest
+            build: true
+          - os: macos-15-intel
+            build: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Users' `brew install` auto-updates Homebrew; do the same once here.
+      # The formula's `fetch` phase and `std_cargo_args --offline` need
+      # Homebrew 6.0.22+, and hosted images can ship older versions. Update
+      # before linking the tap so `brew update` never touches this checkout.
+      - name: Update Homebrew
+        run: |
+          set -euo pipefail
+          brew update
+          version="$(brew --version | awk 'NR==1 {print $2}')"
+          echo "Homebrew $version"
+          python3 -c 'import sys; v=tuple(int(x) for x in sys.argv[1].split("-")[0].split(".")[:3]); sys.exit(0 if v >= (6,0,22) else f"Homebrew {sys.argv[1]} < 6.0.22")' "$version"
+
+      - name: Use this checkout as wiresock/tap
+        run: |
+          set -euo pipefail
+          tap_dir="$(brew --repository)/Library/Taps/wiresock/homebrew-tap"
+          mkdir -p "$(dirname "$tap_dir")"
+          rm -rf "$tap_dir"
+          ln -s "$GITHUB_WORKSPACE" "$tap_dir"
+          brew tap | grep -Fx wiresock/tap
+          uname -m
+          brew config | grep -E '^(HOMEBREW_VERSION|HOMEBREW_PREFIX|macOS):'
+
+      - name: Style and audit
+        run: |
+          set -euo pipefail
+          brew style wiresock/tap
+          brew audit --strict --online wiresock/tap/alighieri
+          # The prefix differs between Apple Silicon and Intel.
+          if grep -nE '/opt/homebrew|/usr/local' Formula/alighieri.rb; then
+            echo "formula hard-codes a Homebrew prefix" >&2
+            exit 1
+          fi
+
+      - name: Formula metadata selects the v0.7.0 source
+        run: |
+          set -euo pipefail
+          brew info --json=v2 --formula wiresock/tap/alighieri >"$RUNNER_TEMP/info.json"
+          python3 - "$RUNNER_TEMP/info.json" <<'PY'
+          import json, os, sys
+          f = json.load(open(sys.argv[1]))["formulae"][0]
+          stable = f["urls"]["stable"]
+          head = f["urls"]["head"]
+          checks = {
+              "stable version": (f["versions"]["stable"], os.environ["EXPECTED_VERSION"]),
+              "stable url": (stable["url"], os.environ["EXPECTED_URL"]),
+              "stable sha256": (stable["checksum"], os.environ["EXPECTED_SHA256"]),
+              "head url": (head["url"], "https://github.com/wiresock/alighieri.git"),
+              "head branch": (head["branch"], "main"),
+              "tap": (f["tap"], "wiresock/tap"),
+          }
+          bad = {k: v for k, v in checks.items() if v[0] != v[1]}
+          for k, (got, want) in checks.items():
+              print(f"{'ok ' if (got == want) else 'BAD'} {k}: {got}")
+          if bad or f.get("deprecated") or f.get("disabled"):
+              sys.exit(f"unexpected formula metadata: {bad}")
+          PY
+
+      - name: Source archive is the released v0.7.0 tree
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/alighieri-src.tar.gz"
+          curl -fsSL -o "$archive" "$EXPECTED_URL"
+          echo "${EXPECTED_SHA256}  ${archive}" | shasum -a 256 -c -
+          python3 - "$archive" <<'PY'
+          import os, re, sys, tarfile
+          t = tarfile.open(sys.argv[1])
+          commit = t.pax_headers.get("comment")
+          if commit != os.environ["EXPECTED_COMMIT"]:
+              sys.exit(f"archive commit {commit} != {os.environ['EXPECTED_COMMIT']}")
+          root = t.getnames()[0].split("/")[0]
+          read = lambda p: t.extractfile(f"{root}/{p}").read().decode()
+          manifest = re.search(r'(?m)^version = "([^"]+)"', read("Cargo.toml")).group(1)
+          blocks = read("Cargo.lock").split("[[package]]")
+          def versions(name, root_only=False):
+              found = []
+              for b in blocks:
+                  if not re.search(rf'(?m)^name = "{name}"$', b):
+                      continue
+                  if root_only and re.search(r'(?m)^source = ', b):
+                      continue
+                  found.append(re.search(r'(?m)^version = "([^"]+)"', b).group(1))
+              return found
+          root_lock = versions("alighieri", root_only=True)
+          rustls = versions("rustls")
+          want = os.environ["EXPECTED_VERSION"]
+          print(f"commit={commit} Cargo.toml={manifest} Cargo.lock root={root_lock} rustls={rustls}")
+          if manifest != want or root_lock != [want]:
+              sys.exit("archive is not the expected release version")
+          if rustls != [os.environ["EXPECTED_RUSTLS"]]:
+              sys.exit(f"archive rustls {rustls} != {os.environ['EXPECTED_RUSTLS']}")
+          PY
+
+      - name: Livecheck reports the published release
+        run: |
+          set -euo pipefail
+          brew livecheck --json wiresock/tap/alighieri | tee "$RUNNER_TEMP/livecheck.json"
+          python3 - "$RUNNER_TEMP/livecheck.json" <<'PY'
+          import json, os, sys
+          entry = json.load(open(sys.argv[1]))[0]
+          latest = entry["version"]["latest"]
+          if latest != os.environ["EXPECTED_VERSION"] or entry["version"]["outdated"]:
+              sys.exit(f"livecheck latest={latest} outdated={entry['version']['outdated']}")
+          print(f"livecheck latest={latest}, up to date")
+          PY
+
+      - name: Install stable (no --HEAD)
+        if: matrix.build
+        run: |
+          set -euo pipefail
+          brew install --formula --verbose wiresock/tap/alighieri 2>&1 | tee "$RUNNER_TEMP/install.log"
+          # The build ran offline after the fetch phase (std_cargo_args adds
+          # --offline only when that phase exists).
+          grep -F "cargo fetch --locked" "$RUNNER_TEMP/install.log" >/dev/null
+          grep -E "cargo install .*--offline" "$RUNNER_TEMP/install.log" >/dev/null
+          # The source Homebrew actually downloaded is the verified archive.
+          cached="$(brew --cache --formula wiresock/tap/alighieri)"
+          echo "${EXPECTED_SHA256}  ${cached}" | shasum -a 256 -c -
+          # Query this formula only (`--installed` would list every formula).
+          installed="$(brew info --json=v2 --formula wiresock/tap/alighieri \
+            | python3 -c 'import json,sys; f=[x for x in json.load(sys.stdin)["formulae"] if x["full_name"]=="wiresock/tap/alighieri"][0]; print(",".join(i["version"] for i in f["installed"]))')"
+          test "$installed" = "$EXPECTED_VERSION" || { echo "installed $installed" >&2; exit 1; }
+          # Only the console binary: no Linux installer companion, no RDP helpers.
+          test "$(ls "$(brew --prefix alighieri)/bin")" = "alighieri"
+
+      - name: Test the installed formula
+        if: matrix.build
+        run: |
+          set -euo pipefail
+          brew test wiresock/tap/alighieri
+          test "$(command -v alighieri)" = "$(brew --prefix)/bin/alighieri"
+          version="$(alighieri --version)"
+          echo "$version"
+          test "$version" = "alighieri ${EXPECTED_VERSION}"
+          alighieri --check --config "$(brew --prefix)/etc/alighieri.conf"
+          brew info wiresock/tap/alighieri  # prints the caveats
+
+      - name: brew services runs the Homebrew config
+        if: matrix.build
+        run: |
+          set -euo pipefail
+          wait_port() {  # $1 = open|closed
+            for _ in $(seq 1 60); do
+              if nc -z 127.0.0.1 1080 2>/dev/null; then [ "$1" = open ] && return 0
+              else [ "$1" = closed ] && return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+          wait_port closed || { echo "port 1080 already in use" >&2; exit 1; }
+          brew services start alighieri
+          wait_port open || { brew services info alighieri; cat "$(brew --prefix)/var/log/alighieri.log" || true; exit 1; }
+          brew services list
+          brew services info --json alighieri >"$RUNNER_TEMP/service.json"
+          python3 - "$RUNNER_TEMP/service.json" <<'PY'
+          import json, os, plistlib, subprocess, sys
+          svc = json.load(open(sys.argv[1]))[0]
+          prefix = subprocess.check_output(["brew", "--prefix"], text=True).strip()
+          opt = subprocess.check_output(["brew", "--prefix", "alighieri"], text=True).strip()
+          job = plistlib.load(open(svc["file"], "rb"))
+          want = [f"{opt}/bin/alighieri", "--config", f"{prefix}/etc/alighieri.conf"]
+          print(f"running={svc['running']} args={job['ProgramArguments']}")
+          if not svc["running"] or job["ProgramArguments"] != want:
+              sys.exit(f"unexpected service: want {want}")
+          # The manual LaunchAgent label belongs to the upstream plist, not Homebrew.
+          if job["Label"] == "com.wiresock.alighieri":
+              sys.exit("Homebrew service reused the manual LaunchAgent label")
+          PY
+          # A real SOCKS5 greeting: no-auth offered, no-auth selected.
+          python3 - <<'PY'
+          import socket
+          s = socket.create_connection(("127.0.0.1", 1080), timeout=10)
+          s.sendall(b"\x05\x01\x00")
+          reply = s.recv(2)
+          assert reply == b"\x05\x00", reply
+          print("SOCKS5 greeting ok")
+          PY
+          brew services stop alighieri
+          wait_port closed || { echo "service did not stop" >&2; exit 1; }
+
+      - name: Reinstall preserves a locally edited config
+        if: matrix.build
+        run: |
+          set -euo pipefail
+          conf="$(brew --prefix)/etc/alighieri.conf"
+          echo "# ci: local edit" >>"$conf"
+          brew reinstall --formula wiresock/tap/alighieri
+          grep -Fx "# ci: local edit" "$conf"
+          test "$(alighieri --version)" = "alighieri ${EXPECTED_VERSION}"
+          alighieri --check --config "$conf"
+          brew test wiresock/tap/alighieri
+
+      - name: Uninstall removes the binary and keeps the config
+        if: matrix.build
+        run: |
+          set -euo pipefail
+          conf="$(brew --prefix)/etc/alighieri.conf"
+          brew uninstall --formula alighieri
+          test ! -e "$(brew --prefix)/bin/alighieri"
+          grep -Fx "# ci: local edit" "$conf"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          brew config || true
+          brew services list || true
+          tail -n 200 "$(brew --prefix)/var/log/alighieri.log" 2>/dev/null || true
+          find "$HOME/Library/Logs/Homebrew" -type f -name '*.log' -path '*alighieri*' \
+            -exec sh -c 'echo "===== $1"; tail -n 200 "$1"' _ {} \; 2>/dev/null || true
