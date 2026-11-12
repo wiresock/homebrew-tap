@@ -1,8 +1,8 @@
 class Alighieri < Formula
   desc "Lightweight SOCKS5 proxy with Dante-inspired configuration"
   homepage "https://github.com/wiresock/alighieri"
-  url "https://github.com/wiresock/alighieri/archive/refs/tags/v0.7.3.tar.gz"
-  sha256 "bebc582189eb32309f984a2c1d7dccf9a1198cace6579241bdd9f6096e66ce2f"
+  url "https://github.com/wiresock/alighieri/archive/refs/tags/v0.8.0.tar.gz"
+  sha256 "af7e6bc1572f653340cd4d78d45209941eba7de4dc8d81d80b119538d9d20ca4"
   license "AGPL-3.0-or-later"
   head "https://github.com/wiresock/alighieri.git", branch: "main"
 

@@ -23,10 +23,10 @@ env:
   HOMEBREW_NO_ENV_HINTS: 1
   # livecheck's github_latest strategy uses the GitHub API.
   HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
-  EXPECTED_VERSION: "0.7.3"
-  EXPECTED_URL: https://github.com/wiresock/alighieri/archive/refs/tags/v0.7.3.tar.gz
-  EXPECTED_SHA256: bebc582189eb32309f984a2c1d7dccf9a1198cace6579241bdd9f6096e66ce2f
-  EXPECTED_COMMIT: ef3160079ae2b6dc184b0b3ef28d74524709e936
+  EXPECTED_VERSION: "0.8.0"
+  EXPECTED_URL: https://github.com/wiresock/alighieri/archive/refs/tags/v0.8.0.tar.gz
+  EXPECTED_SHA256: af7e6bc1572f653340cd4d78d45209941eba7de4dc8d81d80b119538d9d20ca4
+  EXPECTED_COMMIT: 13e885a944d5f28383fae9c0cb50b2b7e276055d
   EXPECTED_RUSTLS: "0.23.46"
 
 jobs:
@@ -88,7 +88,7 @@ jobs:
             exit 1
           fi
 
-      - name: Formula metadata selects the v0.7.3 source
+      - name: Formula metadata selects the v0.8.0 source
         run: |
           set -euo pipefail
           brew info --json=v2 --formula wiresock/tap/alighieri >"$RUNNER_TEMP/info.json"
@@ -112,7 +112,7 @@ jobs:
               sys.exit(f"unexpected formula metadata: {bad}")
           PY
 
-      - name: Source archive is the released v0.7.3 tree
+      - name: Source archive is the released v0.8.0 tree
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/alighieri-src.tar.gz"
